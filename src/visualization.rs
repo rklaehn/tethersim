@@ -17,6 +17,10 @@ use crate::physics::{self, TetherParams, TetherState, MOON_RADIUS};
 /// 1 world unit = 1 km.
 const M2W: f32 = 0.001;
 
+/// Fixed dimensions for the stress graph GIF.
+const STRESS_GIF_W: u32 = 500;
+const STRESS_GIF_H: u32 = 300;
+
 #[derive(Component)]
 pub struct MoonMarker;
 
@@ -619,20 +623,24 @@ pub fn handle_reset(
 
 // --- Video Recording ---
 
-/// State for MP4 recording.
+/// State for MP4 + stress GIF recording.
 #[derive(Resource)]
 pub struct RecordingState {
     pub recording: bool,
     frame_counter: u32,
     /// Capture every N render frames (~10fps at 60fps).
     pub frame_skip: u32,
-    /// Collected frames (RGBA).
+    /// Collected frames (RGBA) for MP4.
     frames: Vec<Vec<u8>>,
     width: u32,
     height: u32,
+    /// Collected stress graph frames (RGBA) for GIF.
+    stress_frames: Vec<Vec<u8>>,
     pub max_frames: usize,
     /// Status message shown in UI (shared with encoding thread).
     pub status: Arc<Mutex<String>>,
+    /// Optional name prefix for output files (defaults to recording-<timestamp>).
+    pub name: String,
 }
 
 impl Default for RecordingState {
@@ -644,8 +652,10 @@ impl Default for RecordingState {
             frames: Vec::new(),
             width: 0,
             height: 0,
+            stress_frames: Vec::new(),
             max_frames: 9000,
             status: Arc::new(Mutex::new(String::new())),
+            name: String::new(),
         }
     }
 }
@@ -659,25 +669,51 @@ impl RecordingState {
     pub fn start(&mut self) {
         self.recording = true;
         self.frames.clear();
+        self.stress_frames.clear();
         self.frame_counter = 0;
         *self.status.lock().unwrap() = String::new();
     }
 
-    /// Stop recording and encode MP4 on a background thread.
+    /// Stop recording and save both MP4 and stress GIF.
     pub fn stop_and_save(&mut self) {
         self.recording = false;
+        self.save();
+    }
+
+    /// Save collected frames (called by stop_and_save and auto-save).
+    fn save(&mut self) {
         let frames = std::mem::take(&mut self.frames);
-        if frames.is_empty() {
+        let stress_frames = std::mem::take(&mut self.stress_frames);
+        if frames.is_empty() && stress_frames.is_empty() {
             return;
         }
         let w = self.width;
         let h = self.height;
         let skip = self.frame_skip;
         let status = self.status.clone();
-        *status.lock().unwrap() = format!("Encoding {} frames...", frames.len());
-        std::thread::spawn(move || {
-            save_recording_mp4(frames, w, h, skip, status);
-        });
+
+        let base = if self.name.trim().is_empty() {
+            format!("recording-{}", recording_timestamp())
+        } else {
+            self.name.trim().to_string()
+        };
+
+        if !frames.is_empty() {
+            let mp4_path = format!("{base}.mp4");
+            let status_mp4 = status.clone();
+            *status.lock().unwrap() = format!("Encoding {} frames...", frames.len());
+            std::thread::spawn(move || {
+                save_recording_mp4(frames, w, h, skip, mp4_path, status_mp4);
+            });
+        }
+
+        if !stress_frames.is_empty() {
+            let gif_path = format!("{base}-stress.gif");
+            let status_gif = status.clone();
+            std::thread::spawn(move || {
+                save_stress_gif(stress_frames, STRESS_GIF_W, STRESS_GIF_H, skip, gif_path, status_gif);
+            });
+        }
     }
 }
 
@@ -700,20 +736,8 @@ impl openh264::formats::RGBSource for RgbFrame<'_> {
     }
 }
 
-/// Encode collected RGBA frames as H.264 MP4 using openh264 + minimp4.
-fn save_recording_mp4(
-    frames: Vec<Vec<u8>>,
-    width: u32,
-    height: u32,
-    frame_skip: u32,
-    status: Arc<Mutex<String>>,
-) {
-    use openh264::encoder::Encoder;
-    use openh264::formats::YUVBuffer;
-
-    let total = frames.len();
-
-    // Timestamp-based filename
+/// Generate a timestamp string for recording filenames.
+fn recording_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -741,7 +765,22 @@ fn save_recording_mp4(
         }
         (y, mo + 1, d + 1)
     };
-    let path = format!("recording-{year:04}{month:02}{day:02}T{hr:02}{mi:02}{se:02}.mp4");
+    format!("{year:04}{month:02}{day:02}T{hr:02}{mi:02}{se:02}")
+}
+
+/// Encode collected RGBA frames as H.264 MP4 using openh264 + minimp4.
+fn save_recording_mp4(
+    frames: Vec<Vec<u8>>,
+    width: u32,
+    height: u32,
+    frame_skip: u32,
+    path: String,
+    status: Arc<Mutex<String>>,
+) {
+    use openh264::encoder::Encoder;
+    use openh264::formats::YUVBuffer;
+
+    let total = frames.len();
 
     // H.264 requires even dimensions
     let enc_w = (width & !1) as usize;
@@ -806,19 +845,177 @@ fn save_recording_mp4(
     *status.lock().unwrap() = format!("Saved {path}");
 }
 
-/// System: spawn screenshot entities while recording.
-pub fn capture_recording_frames(mut recording: ResMut<RecordingState>, mut commands: Commands) {
+/// Map stress ratio to RGB color: green → yellow → red.
+fn stress_color_rgb(ratio: f32) -> (u8, u8, u8) {
+    let r = ratio.clamp(0.0, 1.0);
+    if r < 0.5 {
+        let t = r * 2.0;
+        ((t * 255.0) as u8, 255, 0)
+    } else {
+        let t = (r - 0.5) * 2.0;
+        (255, ((1.0 - t) * 255.0) as u8, 0)
+    }
+}
+
+/// Fill a rectangle in an RGBA pixel buffer.
+fn fill_rect(buf: &mut [u8], w: u32, x0: u32, y0: u32, x1: u32, y1: u32, r: u8, g: u8, b: u8) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * w + x) * 4) as usize;
+            buf[i] = r;
+            buf[i + 1] = g;
+            buf[i + 2] = b;
+            buf[i + 3] = 255;
+        }
+    }
+}
+
+/// Draw a horizontal line in an RGBA pixel buffer.
+fn hline(buf: &mut [u8], w: u32, x0: u32, x1: u32, y: u32, r: u8, g: u8, b: u8) {
+    for x in x0..x1 {
+        let i = ((y * w + x) * 4) as usize;
+        buf[i] = r;
+        buf[i + 1] = g;
+        buf[i + 2] = b;
+        buf[i + 3] = 255;
+    }
+}
+
+/// Software-render the stress monitor chart to an RGBA pixel buffer.
+fn render_stress_frame(monitor: &StressMonitor, fractured: bool, width: u32, height: u32) -> Vec<u8> {
+    let mut buf = vec![20u8; (width * height * 4) as usize];
+    // Set alpha channel to 255 and fill dark background
+    for y in 0..height {
+        for x in 0..width {
+            let i = ((y * width + x) * 4) as usize;
+            buf[i] = 20;
+            buf[i + 1] = 20;
+            buf[i + 2] = 20;
+            buf[i + 3] = 255;
+        }
+    }
+
+    let n = monitor.current.len();
+    if n == 0 {
+        return buf;
+    }
+
+    let max_y = 1.25_f32;
+    let bar_w = width as f32 / n as f32;
+
+    // Grid lines at 25%, 50%, 75%, 100%
+    for &level in &[0.25_f32, 0.5, 0.75, 1.0] {
+        let y = (height as f32 * (1.0 - level / max_y)) as u32;
+        if y < height {
+            let (cr, cg, cb) = if (level - 1.0).abs() < 0.01 {
+                (255, 60, 60)
+            } else {
+                (50, 50, 50)
+            };
+            hline(&mut buf, width, 0, width, y, cr, cg, cb);
+        }
+    }
+
+    // Bars and markers
+    for i in 0..n {
+        let x0 = (i as f32 * bar_w) as u32;
+        let x1 = (((i + 1) as f32 * bar_w) as u32).min(width);
+
+        // Current stress bar
+        let ratio = (monitor.current[i] as f32).clamp(0.0, max_y);
+        let bar_h = (height as f32 * ratio / max_y) as u32;
+        if bar_h > 0 {
+            let (cr, cg, cb) = stress_color_rgb(monitor.current[i] as f32);
+            let y0 = height.saturating_sub(bar_h);
+            fill_rect(&mut buf, width, x0, y0, x1, height, cr, cg, cb);
+        }
+
+        // Expected stress marker (cyan) — hide once tether has fractured
+        if !fractured && i < monitor.expected.len() {
+            let exp = (monitor.expected[i] as f32).clamp(0.0, max_y);
+            if exp > 0.01 {
+                let y = (height as f32 * (1.0 - exp / max_y)) as u32;
+                if y < height {
+                    hline(&mut buf, width, x0, x1, y, 0, 200, 255);
+                }
+            }
+        }
+
+        // Peak marker (white, 2px thick)
+        if i < monitor.peak.len() && monitor.settled_reset_done {
+            let peak = (monitor.peak[i] as f32).clamp(0.0, max_y);
+            if peak > 0.01 {
+                let y = (height as f32 * (1.0 - peak / max_y)) as u32;
+                if y < height {
+                    hline(&mut buf, width, x0, x1, y, 255, 255, 255);
+                    if y + 1 < height {
+                        hline(&mut buf, width, x0, x1, y + 1, 255, 255, 255);
+                    }
+                }
+            }
+        }
+    }
+
+    buf
+}
+
+/// Encode stress graph frames as an animated GIF.
+fn save_stress_gif(
+    frames: Vec<Vec<u8>>,
+    width: u32,
+    height: u32,
+    frame_skip: u32,
+    path: String,
+    status: Arc<Mutex<String>>,
+) {
+    let total = frames.len();
+    let delay_ms = ((frame_skip as f64 / 60.0) * 1000.0) as u32;
+    let delay_ms = delay_ms.max(10); // GIF minimum ~10ms
+
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            *status.lock().unwrap() = format!("GIF file: {e}");
+            return;
+        }
+    };
+
+    let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(file, 10);
+    if let Err(e) = encoder.set_repeat(image::codecs::gif::Repeat::Infinite) {
+        *status.lock().unwrap() = format!("GIF repeat: {e}");
+        return;
+    }
+
+    for (i, rgba) in frames.iter().enumerate() {
+        let img = match image::RgbaImage::from_raw(width, height, rgba.clone()) {
+            Some(img) => img,
+            None => continue,
+        };
+        let delay = image::Delay::from_numer_denom_ms(delay_ms, 1);
+        let frame = image::Frame::from_parts(img, 0, 0, delay);
+        if let Err(e) = encoder.encode_frame(frame) {
+            *status.lock().unwrap() = format!("GIF encode: {e}");
+            return;
+        }
+        if (i + 1) % 100 == 0 {
+            *status.lock().unwrap() = format!("Stress GIF {}/{}...", i + 1, total);
+        }
+    }
+
+    *status.lock().unwrap() = format!("Saved {path}");
+}
+
+/// System: spawn screenshot entities and capture stress frames while recording.
+pub fn capture_recording_frames(
+    mut recording: ResMut<RecordingState>,
+    mut commands: Commands,
+    monitor: Res<StressMonitor>,
+    state: Res<TetherState>,
+    params: Res<TetherParams>,
+) {
     // Auto-save when limit was reached
     if !recording.recording && !recording.frames.is_empty() {
-        let frames = std::mem::take(&mut recording.frames);
-        let w = recording.width;
-        let h = recording.height;
-        let skip = recording.frame_skip;
-        let status = recording.status.clone();
-        *status.lock().unwrap() = format!("Encoding {} frames (limit reached)...", frames.len());
-        std::thread::spawn(move || {
-            save_recording_mp4(frames, w, h, skip, status);
-        });
+        recording.save();
         return;
     }
     if !recording.recording {
@@ -827,6 +1024,10 @@ pub fn capture_recording_frames(mut recording: ResMut<RecordingState>, mut comma
     recording.frame_counter += 1;
     if recording.frame_counter % recording.frame_skip == 0 {
         commands.spawn(Screenshot::primary_window());
+        // Software-render stress graph frame
+        let fractured = state.springs.len() < params.num_segments;
+        let frame = render_stress_frame(&monitor, fractured, STRESS_GIF_W, STRESS_GIF_H);
+        recording.stress_frames.push(frame);
     }
 }
 

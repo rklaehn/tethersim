@@ -124,6 +124,10 @@ pub fn parameter_panel(
 
                 ui.separator();
                 ui.strong("Recording");
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut recording.name);
+                });
                 ui.checkbox(&mut control.auto_record, "Auto-record");
                 if control.auto_record {
                     ui.label("Before release (s):");
