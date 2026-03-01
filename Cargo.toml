@@ -1,0 +1,10 @@
+[package]
+name = "tethersim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.17.2", features = ["jpeg"] }
+bevy_egui = "0.38"
+minimp4 = "0.1.2"
+openh264 = "0.9.3"
