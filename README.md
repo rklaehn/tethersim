@@ -77,6 +77,21 @@ Right panel: live readouts (tip velocity, kinetic energy, stress monitor).
 Press **G** to toggle video recording. Auto-record captures a window around the
 release event.
 
+## Getting started (no Rust experience needed)
+
+1. Install Rust: https://rustup.rs/
+2. Clone and run:
+   ```
+   git clone <this repo>
+   cd tethersim
+   cargo run --release
+   ```
+   The first build takes a few minutes. Subsequent runs are fast.
+
+## Blog post
+
+[Lunar Sling Launcher - Tether Dynamics](https://blog.klaehn.org/blog/lunar-sling-launcher-tether-dynamics/)
+
 ## Credits
 
-Coded with [Claude Code](https://claude.com/claude-code).
+Created by [Rüdiger Klaehn](https://blog.klaehn.org/) using [Claude](https://claude.ai/).
